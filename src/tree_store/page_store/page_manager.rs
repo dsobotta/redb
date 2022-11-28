@@ -11,16 +11,15 @@ use crate::tree_store::page_store::{hash128_with_seed, PageImpl, PageMut};
 use crate::tree_store::PageNumber;
 use crate::Error;
 use crate::Result;
-use std::cmp::{max, min};
+use std::cmp::max;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs::File;
+#[cfg(unix)]
 use std::io;
-use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
@@ -34,7 +33,6 @@ use std::sync::{Mutex, MutexGuard};
 // 1 byte: god byte
 // 2 byte: padding
 // 4 bytes: page size
-// 8 bytes: database max size
 // Definition of region
 // 4 bytes: region header pages
 // 4 bytes: region max data pages
@@ -66,6 +64,9 @@ pub(crate) const MAX_MAX_PAGE_ORDER: usize = 20;
 pub(super) const MIN_USABLE_PAGES: usize = 10;
 const MIN_DESIRED_USABLE_BYTES: usize = 1024 * 1024;
 
+// TODO: allocate more tracker space when it becomes exhausted, and remove this hard coded 1000 regions
+const NUM_REGIONS: u32 = 1000;
+
 // TODO: set to 1, when version 1.0 is released
 const FILE_FORMAT_VERSION: u8 = 107;
 
@@ -73,13 +74,12 @@ const FILE_FORMAT_VERSION: u8 = 107;
 const MAGICNUMBER: [u8; 9] = [b'r', b'e', b'd', b'b', 0x1A, 0x0A, 0xA9, 0x0D, 0x0A];
 const GOD_BYTE_OFFSET: usize = MAGICNUMBER.len();
 const PAGE_SIZE_OFFSET: usize = GOD_BYTE_OFFSET + size_of::<u8>() + 2; // +2 for padding
-const DB_SIZE_OFFSET: usize = PAGE_SIZE_OFFSET + size_of::<u32>();
-const REGION_HEADER_PAGES_OFFSET: usize = DB_SIZE_OFFSET + size_of::<u64>();
+const REGION_HEADER_PAGES_OFFSET: usize = PAGE_SIZE_OFFSET + size_of::<u32>();
 const REGION_MAX_DATA_PAGES_OFFSET: usize = REGION_HEADER_PAGES_OFFSET + size_of::<u32>();
 const TRANSACTION_SIZE: usize = 128;
 const TRANSACTION_0_OFFSET: usize = 64;
 const TRANSACTION_1_OFFSET: usize = TRANSACTION_0_OFFSET + TRANSACTION_SIZE;
-pub(crate) const DB_HEADER_SIZE: usize = TRANSACTION_1_OFFSET + TRANSACTION_SIZE;
+pub(super) const DB_HEADER_SIZE: usize = TRANSACTION_1_OFFSET + TRANSACTION_SIZE;
 
 // God byte flags
 const PRIMARY_BIT: u8 = 1;
@@ -110,14 +110,6 @@ fn ceil_log2(x: usize) -> usize {
     } else {
         x.next_power_of_two().trailing_zeros() as usize
     }
-}
-
-pub(crate) fn get_db_size(path: impl AsRef<Path>) -> Result<u64, io::Error> {
-    let mut db_size = [0u8; size_of::<u64>()];
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(DB_SIZE_OFFSET as u64))?;
-    file.read_exact(&mut db_size)?;
-    Ok(u64::from_le_bytes(db_size))
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -258,19 +250,6 @@ impl<'a> MetadataAccessor<'a> {
         }
     }
 
-    fn get_max_capacity(&self) -> u64 {
-        u64::from_le_bytes(
-            self.header[DB_SIZE_OFFSET..DB_SIZE_OFFSET + size_of::<u64>()]
-                .try_into()
-                .unwrap(),
-        )
-    }
-
-    fn set_max_capacity(&mut self, max_size: u64) {
-        self.header[DB_SIZE_OFFSET..DB_SIZE_OFFSET + size_of::<u64>()]
-            .copy_from_slice(&max_size.to_le_bytes());
-    }
-
     fn get_magic_number(&self) -> [u8; MAGICNUMBER.len()] {
         self.header[..MAGICNUMBER.len()].try_into().unwrap()
     }
@@ -347,15 +326,6 @@ impl<'a> MetadataAccessor<'a> {
     }
 
     fn initialize_region_tracker(&mut self, layout: &DatabaseLayout, tracker_page: PageNumber) {
-        let max_regions = DatabaseLayout::calculate(
-            self.get_max_capacity(),
-            self.get_max_capacity(),
-            self.get_region_max_data_pages(),
-            self.get_page_size(),
-        )
-        .unwrap()
-        .num_regions();
-
         let page_size = self.get_page_size() as usize;
         let region_pages_start =
             (layout.full_region_layout().get_header_pages() as usize) * page_size;
@@ -371,7 +341,7 @@ impl<'a> MetadataAccessor<'a> {
         // calls into MetadataAccessor
         assert!(range.start >= DB_HEADER_SIZE);
         let mem = unsafe { self.mmap.get_memory_mut(range) };
-        RegionTracker::init_new(max_regions, MAX_MAX_PAGE_ORDER + 1, mem);
+        RegionTracker::init_new(NUM_REGIONS, MAX_MAX_PAGE_ORDER + 1, mem);
     }
 
     // Note: It's very important that the lifetime of the returned allocator accessors is the same
@@ -465,7 +435,7 @@ impl<'a> RegionTracker<'a> {
         result
     }
 
-    pub(crate) fn find_free(&self, order: usize) -> Result<u64> {
+    pub(crate) fn find_free(&self, order: usize) -> Option<u64> {
         let mem = self.get_order(order);
         let accessor = BtreeBitmap::new(mem);
         accessor.find_first_unset()
@@ -756,7 +726,6 @@ pub(crate) struct TransactionalMemory {
     region_size: u64,
     region_header_with_padding_size: usize,
     db_header_size: usize,
-    dynamic_growth: bool,
     #[allow(dead_code)]
     pages_are_os_page_aligned: bool,
 }
@@ -764,10 +733,9 @@ pub(crate) struct TransactionalMemory {
 impl TransactionalMemory {
     pub(crate) fn new(
         file: File,
-        max_capacity: u64,
         requested_page_size: Option<usize>,
         requested_region_size: Option<usize>,
-        dynamic_growth: bool,
+        initial_size: Option<u64>,
         write_strategy: Option<WriteStrategy>,
     ) -> Result<Self> {
         #[allow(clippy::assertions_on_constants)]
@@ -777,23 +745,18 @@ impl TransactionalMemory {
 
         let page_size = requested_page_size.unwrap_or_else(get_page_size);
         assert!(page_size.is_power_of_two() && page_size >= DB_HEADER_SIZE);
-        if max_capacity < (DB_HEADER_SIZE + page_size * MIN_USABLE_PAGES) as u64 {
-            return Err(Error::OutOfSpace);
-        }
 
         let region_size = requested_region_size
             .map(|x| x as u64)
             .unwrap_or(MAX_USABLE_REGION_SPACE);
         assert!(region_size.is_power_of_two());
-        let max_usable_region_bytes = min(region_size, max_capacity.next_power_of_two() as u64);
-        let max_possible_regions: u32 = ((max_capacity + region_size - 1) / region_size)
-            .try_into()
-            .unwrap();
 
-        // TODO: remove the option of disabling dynamic growth
+        // TODO: allocate more tracker space when it becomes exhausted, and remove this hard coded 1000 regions
         let region_tracker_required_bytes =
-            RegionTracker::required_bytes(max_possible_regions, MAX_MAX_PAGE_ORDER + 1);
-        let starting_size = if dynamic_growth {
+            RegionTracker::required_bytes(NUM_REGIONS, MAX_MAX_PAGE_ORDER + 1);
+        let starting_size = if let Some(size) = initial_size {
+            size
+        } else {
             // Make sure that there is enough room to allocate the region tracker into a page
             let size: u64 = max(MIN_DESIRED_USABLE_BYTES, page_size * MIN_USABLE_PAGES)
                 .try_into()
@@ -801,34 +764,24 @@ impl TransactionalMemory {
             let tracker_space =
                 (page_size * ((region_tracker_required_bytes + page_size - 1) / page_size)) as u64;
             size + tracker_space
-        } else {
-            max_capacity
         };
         let layout = DatabaseLayout::calculate(
-            max_capacity,
             starting_size,
-            (max_usable_region_bytes / u64::try_from(page_size).unwrap())
+            (region_size / u64::try_from(page_size).unwrap())
                 .try_into()
                 .unwrap(),
             page_size.try_into().unwrap(),
         )?;
-        assert!(
-            layout.len() <= max_capacity,
-            "{} > {}",
-            layout.len(),
-            max_capacity
-        );
 
-        let max_cap: usize = max_capacity.try_into().unwrap();
         {
-            let file_len = Mmap::get_valid_length(&file, max_cap)?;
+            let file_len = file.metadata()?.len();
 
             if file_len < layout.len() {
                 file.set_len(layout.len())?;
             }
         }
 
-        let mmap = Mmap::new(file, max_cap)?;
+        let mmap = Mmap::new(file)?;
 
         let mutex = Mutex::new(MetadataGuard {});
         let mut metadata = unsafe { MetadataAccessor::new(&mmap, mutex.lock().unwrap()) };
@@ -841,7 +794,6 @@ impl TransactionalMemory {
             metadata.set_page_size(page_size);
             metadata.set_region_header_pages(layout.full_region_layout().get_header_pages());
             metadata.set_region_max_data_pages(layout.full_region_layout().num_pages());
-            metadata.set_max_capacity(max_capacity);
 
             // Initialize the zeroth region and allocate the region tracker
             let tracker_page = {
@@ -854,7 +806,7 @@ impl TransactionalMemory {
                 let tracker_required_pages =
                     (region_tracker_required_bytes + page_size - 1) / page_size;
                 let required_order = ceil_log2(tracker_required_pages);
-                let page_number = region.allocator_mut().alloc(required_order)?;
+                let page_number = region.allocator_mut().alloc(required_order).unwrap();
                 PageNumber::new(
                     0,
                     page_number.try_into().unwrap(),
@@ -888,7 +840,7 @@ impl TransactionalMemory {
             // TODO: seems like this should be true, not false???
             metadata.set_recovery(false);
 
-            let checksum_type = match write_strategy.unwrap_or_default() {
+            let checksum_type = match write_strategy.unwrap_or(WriteStrategy::Checksum) {
                 WriteStrategy::Checksum => ChecksumType::XXH3_128,
                 WriteStrategy::TwoPhase => ChecksumType::Unused,
             };
@@ -978,7 +930,6 @@ impl TransactionalMemory {
             region_size,
             region_header_with_padding_size: region_header_size,
             db_header_size: layout.superheader_bytes(),
-            dynamic_growth,
             pages_are_os_page_aligned: is_page_aligned(page_size.try_into().unwrap()),
         })
     }
@@ -1163,10 +1114,7 @@ impl TransactionalMemory {
         let mut layout = self.layout.lock().unwrap();
 
         // Trim surplus file space, before finalizing the commit
-        let mut shrunk = false;
-        if self.dynamic_growth {
-            shrunk = self.try_shrink(&mut metadata, &mut layout)?;
-        };
+        let shrunk = self.try_shrink(&mut metadata, &mut layout)?;
 
         let mut secondary = metadata.secondary_slot_mut();
         secondary.set_checksum_type(checksum_type);
@@ -1426,10 +1374,6 @@ impl TransactionalMemory {
 
     // Safety: the caller must ensure that no references to the memory in `page` exist
     pub(crate) unsafe fn free(&self, page: PageNumber) -> Result {
-        // Zero fill the page to ensure that deleted data is not stored in the file
-        let mut mut_page = self.get_page_mut(page);
-        mut_page.memory_mut().fill(0);
-
         let mut metadata = self.lock_metadata();
         let layout = self.layout.lock().unwrap();
         let (mut region_tracker, mut regions) =
@@ -1454,9 +1398,6 @@ impl TransactionalMemory {
     // Safety: the caller must ensure that no references to the memory in `page` exist
     pub(crate) unsafe fn free_if_uncommitted(&self, page: PageNumber) -> Result<bool> {
         if self.allocated_since_commit.lock().unwrap().remove(&page) {
-            // Zero fill the page to ensure that deleted data is not stored in the file
-            let mut mut_page = self.get_page_mut(page);
-            mut_page.memory_mut().fill(0);
             let mut metadata = self.lock_metadata();
             let layout = self.layout.lock().unwrap();
             let (mut region_tracker, mut regions) =
@@ -1485,36 +1426,39 @@ impl TransactionalMemory {
         self.allocated_since_commit.lock().unwrap().contains(&page)
     }
 
+    pub(crate) unsafe fn mark_transaction(&self, id: TransactionId) {
+        self.mmap.mark_transaction(id)
+    }
+
+    pub(crate) unsafe fn mmap_gc(&self, oldest_live_id: TransactionId) -> Result {
+        self.mmap.gc(oldest_live_id)
+    }
+
     fn allocate_helper(
         &self,
         metadata: &mut MetadataAccessor,
         layout: &InProgressLayout,
         required_order: usize,
-    ) -> Result<PageNumber> {
+    ) -> Result<Option<PageNumber>> {
         let (mut region_tracker, mut regions) =
             metadata.allocators_mut(&layout.layout, layout.tracker_page)?;
         loop {
-            let candidate_region = region_tracker
-                .find_free(required_order)?
-                .try_into()
-                .unwrap();
+            let candidate_region = if let Some(candidate) = region_tracker.find_free(required_order)
+            {
+                candidate.try_into().unwrap()
+            } else {
+                return Ok(None);
+            };
             let mut region = regions.get_region_mut(candidate_region);
-            match region.allocator_mut().alloc(required_order) {
-                Ok(page) => {
-                    return Ok(PageNumber::new(
-                        candidate_region,
-                        page.try_into().unwrap(),
-                        required_order.try_into().unwrap(),
-                    ));
-                }
-                Err(err) => {
-                    if matches!(err, Error::OutOfSpace) {
-                        // Mark the region, if it's full
-                        region_tracker.mark_full(required_order, candidate_region as u64);
-                    } else {
-                        return Err(err);
-                    }
-                }
+            if let Some(page) = region.allocator_mut().alloc(required_order) {
+                return Ok(Some(PageNumber::new(
+                    candidate_region,
+                    page.try_into().unwrap(),
+                    required_order.try_into().unwrap(),
+                )));
+            } else {
+                // Mark the region, if it's full
+                region_tracker.mark_full(required_order, candidate_region as u64);
             }
         }
     }
@@ -1567,7 +1511,6 @@ impl TransactionalMemory {
         };
 
         let new_layout = DatabaseLayout::calculate(
-            metadata.get_max_capacity(),
             new_usable_bytes,
             metadata.get_region_max_data_pages(),
             self.page_size.try_into().unwrap(),
@@ -1618,7 +1561,6 @@ impl TransactionalMemory {
             )
         };
         let new_layout = DatabaseLayout::calculate(
-            metadata.get_max_capacity(),
             next_desired_size,
             metadata.get_region_max_data_pages(),
             self.page_size.try_into().unwrap(),
@@ -1626,10 +1568,6 @@ impl TransactionalMemory {
         assert!(new_layout.len() >= layout.len());
         assert_eq!(new_layout.superheader_pages(), layout.superheader_pages());
         assert_eq!(new_layout.superheader_bytes(), self.db_header_size);
-        if new_layout.len() == layout.len() {
-            // Can't grow
-            return Err(Error::OutOfSpace);
-        }
 
         // Safety: We're growing the mmap
         unsafe {
@@ -1674,19 +1612,16 @@ impl TransactionalMemory {
         let required_order = ceil_log2(required_pages);
 
         let mut metadata = self.lock_metadata();
-        let max_capacity = metadata.get_max_capacity();
         let mut layout = self.layout.lock().unwrap();
 
-        let page_number = match self.allocate_helper(&mut metadata, &layout, required_order) {
-            Ok(page_number) => page_number,
-            Err(err) => {
-                if matches!(err, Error::OutOfSpace) && (layout.layout.len() as u64) < max_capacity {
-                    self.grow(&mut metadata, &mut layout, required_order)?;
-                    self.allocate_helper(&mut metadata, &layout, required_order)?
-                } else {
-                    return Err(err);
-                }
-            }
+        let page_number = if let Some(page_number) =
+            self.allocate_helper(&mut metadata, &layout, required_order)?
+        {
+            page_number
+        } else {
+            self.grow(&mut metadata, &mut layout, required_order)?;
+            self.allocate_helper(&mut metadata, &layout, required_order)?
+                .unwrap()
         };
 
         self.allocated_since_commit
@@ -1745,29 +1680,16 @@ impl TransactionalMemory {
         })
     }
 
-    pub(crate) fn count_free_pages(&self) -> Result<usize> {
+    pub(crate) fn count_allocated_pages(&self) -> Result<usize> {
         let mut metadata = self.lock_metadata();
         let layout = self.layout.lock().unwrap();
         let mut count = 0;
         for i in 0..layout.layout.num_regions() {
             let region = metadata.get_region(i, &layout.layout);
-            count += region.allocator().count_free_pages();
+            count += region.allocator().count_allocated_pages();
         }
 
-        // Calculate the number of pages worth of expansion space left, if database grows to max size
-        let max_layout = DatabaseLayout::calculate(
-            metadata.get_max_capacity(),
-            metadata.get_max_capacity(),
-            metadata.get_region_max_data_pages(),
-            self.page_size.try_into().unwrap(),
-        )
-        .unwrap();
-        let potential_growth_pages: usize =
-            ((max_layout.usable_bytes() - layout.layout.usable_bytes()) / (self.page_size as u64))
-                .try_into()
-                .unwrap();
-
-        Ok(count + potential_growth_pages)
+        Ok(count)
     }
 
     pub(crate) fn get_page_size(&self) -> usize {
@@ -1807,27 +1729,25 @@ impl Drop for TransactionalMemory {
 mod test {
     use crate::db::TableDefinition;
     use crate::tree_store::page_store::page_manager::{
-        DB_HEADER_SIZE, GOD_BYTE_OFFSET, MAGICNUMBER, MIN_USABLE_PAGES, PRIMARY_BIT,
-        RECOVERY_REQUIRED, ROOT_CHECKSUM_OFFSET, TRANSACTION_0_OFFSET, TRANSACTION_1_OFFSET,
+        GOD_BYTE_OFFSET, MAGICNUMBER, PRIMARY_BIT, RECOVERY_REQUIRED, ROOT_CHECKSUM_OFFSET,
+        TRANSACTION_0_OFFSET, TRANSACTION_1_OFFSET,
     };
-    use crate::tree_store::page_store::utils::get_page_size;
     use crate::tree_store::page_store::TransactionalMemory;
-    use crate::{Database, Error, ReadableTable, WriteStrategy};
+    use crate::{Database, ReadableTable, WriteStrategy};
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::mem::size_of;
     use tempfile::NamedTempFile;
 
-    const X: TableDefinition<[u8], [u8]> = TableDefinition::new("x");
+    const X: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
 
     #[test]
     fn repair_allocator_no_checksums() {
         let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let max_size = 1024 * 1024;
         let db = unsafe {
             Database::builder()
                 .set_write_strategy(WriteStrategy::TwoPhase)
-                .create(tmpfile.path(), max_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
         let write_txn = db.begin_write().unwrap();
@@ -1837,7 +1757,7 @@ mod test {
         }
         write_txn.commit().unwrap();
         let write_txn = db.begin_write().unwrap();
-        let free_pages = write_txn.stats().unwrap().free_pages();
+        let allocated_pages = write_txn.stats().unwrap().allocated_pages();
         write_txn.abort().unwrap();
         drop(db);
 
@@ -1854,26 +1774,24 @@ mod test {
         buffer[0] |= RECOVERY_REQUIRED;
         file.write_all(&buffer).unwrap();
 
-        assert!(TransactionalMemory::new(
-            file,
-            max_size as u64,
-            None,
-            None,
-            true,
-            Some(WriteStrategy::TwoPhase)
-        )
-        .unwrap()
-        .needs_repair()
-        .unwrap());
+        assert!(
+            TransactionalMemory::new(file, None, None, None, Some(WriteStrategy::TwoPhase))
+                .unwrap()
+                .needs_repair()
+                .unwrap()
+        );
 
         let db2 = unsafe {
             Database::builder()
                 .set_write_strategy(WriteStrategy::TwoPhase)
-                .create(tmpfile.path(), max_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
         let write_txn = db2.begin_write().unwrap();
-        assert_eq!(free_pages, write_txn.stats().unwrap().free_pages());
+        assert_eq!(
+            allocated_pages,
+            write_txn.stats().unwrap().allocated_pages()
+        );
         {
             let mut table = write_txn.open_table(X).unwrap();
             table.insert(b"hello2", b"world2").unwrap();
@@ -1884,11 +1802,10 @@ mod test {
     #[test]
     fn repair_allocator_checksums() {
         let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let max_size = 1024 * 1024;
         let db = unsafe {
             Database::builder()
                 .set_write_strategy(WriteStrategy::Checksum)
-                .create(tmpfile.path(), max_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
         let write_txn = db.begin_write().unwrap();
@@ -1935,19 +1852,14 @@ mod test {
         .unwrap();
         file.write_all(&[0; size_of::<u128>()]).unwrap();
 
-        assert!(TransactionalMemory::new(
-            file,
-            max_size as u64,
-            None,
-            None,
-            true,
-            Some(WriteStrategy::Checksum)
-        )
-        .unwrap()
-        .needs_repair()
-        .unwrap());
+        assert!(
+            TransactionalMemory::new(file, None, None, None, Some(WriteStrategy::Checksum))
+                .unwrap()
+                .needs_repair()
+                .unwrap()
+        );
 
-        let db2 = unsafe { Database::create(tmpfile.path(), max_size).unwrap() };
+        let db2 = unsafe { Database::create(tmpfile.path()).unwrap() };
         let write_txn = db2.begin_write().unwrap();
         {
             let mut table = write_txn.open_table(X).unwrap();
@@ -1960,11 +1872,10 @@ mod test {
     #[test]
     fn change_write_strategy_to_2pc() {
         let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let max_size = 1024 * 1024;
         let db = unsafe {
             Database::builder()
                 .set_write_strategy(WriteStrategy::Checksum)
-                .create(tmpfile.path(), max_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
         let write_txn = db.begin_write().unwrap();
@@ -1974,7 +1885,7 @@ mod test {
         }
         write_txn.commit().unwrap();
         let write_txn = db.begin_write().unwrap();
-        let free_pages = write_txn.stats().unwrap().free_pages();
+        let allocated_pages = write_txn.stats().unwrap().allocated_pages();
         write_txn.abort().unwrap();
         db.set_write_strategy(WriteStrategy::TwoPhase).unwrap();
         drop(db);
@@ -1992,26 +1903,24 @@ mod test {
         buffer[0] |= RECOVERY_REQUIRED;
         file.write_all(&buffer).unwrap();
 
-        assert!(TransactionalMemory::new(
-            file,
-            max_size as u64,
-            None,
-            None,
-            true,
-            Some(WriteStrategy::TwoPhase)
-        )
-        .unwrap()
-        .needs_repair()
-        .unwrap());
+        assert!(
+            TransactionalMemory::new(file, None, None, None, Some(WriteStrategy::TwoPhase))
+                .unwrap()
+                .needs_repair()
+                .unwrap()
+        );
 
         let db2 = unsafe {
             Database::builder()
                 .set_write_strategy(WriteStrategy::TwoPhase)
-                .create(tmpfile.path(), max_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
         let write_txn = db2.begin_write().unwrap();
-        assert_eq!(free_pages, write_txn.stats().unwrap().free_pages());
+        assert_eq!(
+            allocated_pages,
+            write_txn.stats().unwrap().allocated_pages()
+        );
         {
             let mut table = write_txn.open_table(X).unwrap();
             table.insert(b"hello2", b"world2").unwrap();
@@ -2022,11 +1931,10 @@ mod test {
     #[test]
     fn repair_insert_reserve_regression() {
         let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let max_size = 1024 * 1024;
         let db = unsafe {
             Database::builder()
                 .set_write_strategy(WriteStrategy::Checksum)
-                .create(tmpfile.path(), max_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
 
@@ -2061,47 +1969,14 @@ mod test {
         buffer[0] |= RECOVERY_REQUIRED;
         file.write_all(&buffer).unwrap();
 
-        assert!(TransactionalMemory::new(
-            file,
-            max_size as u64,
-            None,
-            None,
-            true,
-            Some(WriteStrategy::Checksum)
-        )
-        .unwrap()
-        .needs_repair()
-        .unwrap());
+        assert!(
+            TransactionalMemory::new(file, None, None, None, Some(WriteStrategy::Checksum))
+                .unwrap()
+                .needs_repair()
+                .unwrap()
+        );
 
         unsafe { Database::open(tmpfile.path()).unwrap() };
-    }
-
-    #[test]
-    fn too_small_db() {
-        let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let result = unsafe { Database::create(tmpfile.path(), 1) };
-        assert!(matches!(result, Err(Error::OutOfSpace)));
-
-        let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let result = unsafe { Database::create(tmpfile.path(), 1024) };
-        assert!(matches!(result, Err(Error::OutOfSpace)));
-
-        let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let result =
-            unsafe { Database::create(tmpfile.path(), MIN_USABLE_PAGES * get_page_size() - 1) };
-        assert!(matches!(result, Err(Error::OutOfSpace)));
-    }
-
-    #[test]
-    fn smallest_db() {
-        let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        unsafe {
-            Database::create(
-                tmpfile.path(),
-                DB_HEADER_SIZE + (MIN_USABLE_PAGES + 2) * get_page_size(),
-            )
-            .unwrap();
-        }
     }
 
     #[test]

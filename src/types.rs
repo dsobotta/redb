@@ -1,11 +1,23 @@
+use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::convert::TryInto;
 use std::fmt::Debug;
 
 pub trait RedbValue: Debug {
-    type View<'a>: Debug + 'a
+    /// SelfType<'a> must be the same type as Self with all lifetimes replaced with 'a
+    type SelfType<'a>: Debug + Borrow<Self::RefBaseType<'a>> + 'a
     where
         Self: 'a;
+
+    /// RefBaseType should be the most basic type such that &RefBaseType is equivalent to &SelfType.
+    /// There must be a 1:1 mapping between values of &RefBaseType and &SelfType, and it must
+    /// serialize to the same byte format
+    ///
+    /// For most types, this should be the same as SelfType, but for type such as String it may be str
+    type RefBaseType<'a>: ?Sized + Debug + 'a
+    where
+        Self: 'a;
+
     type AsBytes<'a>: AsRef<[u8]> + 'a
     where
         Self: 'a;
@@ -15,12 +27,15 @@ pub trait RedbValue: Debug {
 
     /// Deserializes data
     /// Implementations may return a view over data, or an owned type
-    fn from_bytes<'a>(data: &'a [u8]) -> Self::View<'a>
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
     where
         Self: 'a;
 
-    /// Serialize the key to a slice
-    fn as_bytes(&self) -> Self::AsBytes<'_>;
+    /// Serialize the value to a slice
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::RefBaseType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'a,
+        Self: 'b;
 
     /// Globally unique identifier for this type
     fn redb_type_name() -> String;
@@ -32,7 +47,10 @@ pub trait RedbKey: RedbValue {
 }
 
 impl RedbValue for () {
-    type View<'a> = ()
+    type SelfType<'a> = ()
+    where
+        Self: 'a;
+    type RefBaseType<'a> = ()
     where
         Self: 'a;
     type AsBytes<'a> = &'a [u8]
@@ -51,7 +69,11 @@ impl RedbValue for () {
         ()
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    fn as_bytes<'a, 'b: 'a>(_: &'a Self::RefBaseType<'b>) -> &'a [u8]
+    where
+        Self: 'a,
+        Self: 'b,
+    {
         &[]
     }
 
@@ -60,8 +82,13 @@ impl RedbValue for () {
     }
 }
 
+// [u8] is an alias for &[u8], which is why its SelfType is &[u8] instead of [u8]. This allows users to construct TableDefinitions without a lifetime
+// TODO: maybe this is a Bad Idea(tm) and should be removed?
 impl RedbValue for [u8] {
-    type View<'a> = &'a [u8]
+    type SelfType<'a> = &'a [u8]
+    where
+        Self: 'a;
+    type RefBaseType<'a> = [u8]
     where
         Self: 'a;
     type AsBytes<'a> = &'a [u8]
@@ -79,8 +106,12 @@ impl RedbValue for [u8] {
         data
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        self
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::RefBaseType<'b>) -> &'a [u8]
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value
     }
 
     fn redb_type_name() -> String {
@@ -95,12 +126,15 @@ impl RedbKey for [u8] {
 }
 
 impl RedbValue for &[u8] {
-    type View<'a> = &'a [u8]
+    type SelfType<'a> = &'a [u8]
     where
-    Self: 'a;
+        Self: 'a;
+    type RefBaseType<'a> = [u8]
+    where
+        Self: 'a;
     type AsBytes<'a> = &'a [u8]
     where
-    Self: 'a;
+        Self: 'a;
 
     fn fixed_width() -> Option<usize> {
         None
@@ -113,8 +147,12 @@ impl RedbValue for &[u8] {
         data
     }
 
-    fn as_bytes(&self) -> &[u8] {
-        self
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::RefBaseType<'b>) -> &'a [u8]
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value
     }
 
     fn redb_type_name() -> String {
@@ -128,8 +166,11 @@ impl RedbKey for &[u8] {
     }
 }
 
-impl<const N: usize> RedbValue for [u8; N] {
-    type View<'a> = &'a [u8; N]
+impl<const N: usize> RedbValue for &[u8; N] {
+    type SelfType<'a> = &'a [u8; N]
+    where
+        Self: 'a;
+    type RefBaseType<'a> = [u8; N]
     where
         Self: 'a;
     type AsBytes<'a> = &'a [u8; N]
@@ -147,8 +188,12 @@ impl<const N: usize> RedbValue for [u8; N] {
         data.try_into().unwrap()
     }
 
-    fn as_bytes(&self) -> &[u8; N] {
-        self
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::RefBaseType<'b>) -> &'a [u8; N]
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value
     }
 
     fn redb_type_name() -> String {
@@ -156,14 +201,19 @@ impl<const N: usize> RedbValue for [u8; N] {
     }
 }
 
-impl<const N: usize> RedbKey for [u8; N] {
+impl<const N: usize> RedbKey for &[u8; N] {
     fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
         data1.cmp(data2)
     }
 }
 
+// str is an alias for &str, which is why its SelfType is &str instead of str. This allows users to construct TableDefinitions without a lifetime
+// TODO: maybe this is a Bad Idea(tm) and should be removed?
 impl RedbValue for str {
-    type View<'a> = &'a str
+    type SelfType<'a> = &'a str
+    where
+        Self: 'a;
+    type RefBaseType<'a> = str
     where
         Self: 'a;
     type AsBytes<'a> = &'a str
@@ -181,8 +231,12 @@ impl RedbValue for str {
         std::str::from_utf8(data).unwrap()
     }
 
-    fn as_bytes(&self) -> &str {
-        self
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::RefBaseType<'b>) -> &'a str
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value
     }
 
     fn redb_type_name() -> String {
@@ -199,12 +253,15 @@ impl RedbKey for str {
 }
 
 impl RedbValue for &str {
-    type View<'a> = &'a str
+    type SelfType<'a> = &'a str
     where
-    Self: 'a;
+        Self: 'a;
+    type RefBaseType<'a> = str
+    where
+        Self: 'a;
     type AsBytes<'a> = &'a str
     where
-    Self: 'a;
+        Self: 'a;
 
     fn fixed_width() -> Option<usize> {
         None
@@ -217,8 +274,12 @@ impl RedbValue for &str {
         std::str::from_utf8(data).unwrap()
     }
 
-    fn as_bytes(&self) -> &str {
-        self
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::RefBaseType<'b>) -> &'a str
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value
     }
 
     fn redb_type_name() -> String {
@@ -237,7 +298,8 @@ impl RedbKey for &str {
 macro_rules! be_value {
     ($t:ty) => {
         impl RedbValue for $t {
-            type View<'a> = $t;
+            type SelfType<'a> = $t;
+            type RefBaseType<'a> = $t;
             type AsBytes<'a> = [u8; std::mem::size_of::<$t>()] where Self: 'a;
 
             fn fixed_width() -> Option<usize> {
@@ -251,8 +313,14 @@ macro_rules! be_value {
                 <$t>::from_le_bytes(data.try_into().unwrap())
             }
 
-            fn as_bytes(&self) -> [u8; std::mem::size_of::<$t>()] {
-                self.to_le_bytes()
+            fn as_bytes<'a, 'b: 'a>(
+                value: &'a Self::RefBaseType<'b>,
+            ) -> [u8; std::mem::size_of::<$t>()]
+            where
+                Self: 'a,
+                Self: 'b,
+            {
+                value.to_le_bytes()
             }
 
             fn redb_type_name() -> String {

@@ -1,15 +1,14 @@
 use redb::{Database, MultimapTableDefinition, RangeIter, ReadableTable, TableDefinition};
-use std::ops::{Range, RangeFull};
 use std::sync;
 use tempfile::NamedTempFile;
 
-const SLICE_TABLE: TableDefinition<[u8], [u8]> = TableDefinition::new("x");
+const SLICE_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("x");
 const U64_TABLE: TableDefinition<u64, u64> = TableDefinition::new("u64");
 
 #[test]
 fn len() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -27,7 +26,7 @@ fn len() {
 #[test]
 fn stored_size() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -45,7 +44,7 @@ fn stored_size() {
 #[test]
 fn create_open() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
@@ -67,7 +66,7 @@ fn multiple_tables() {
     let definition2: TableDefinition<[u8], [u8]> = TableDefinition::new("2");
 
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(definition1).unwrap();
@@ -90,7 +89,7 @@ fn multiple_tables() {
 #[test]
 fn list_tables() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let definition_x: TableDefinition<[u8], [u8]> = TableDefinition::new("x");
     let definition_y: TableDefinition<[u8], [u8]> = TableDefinition::new("y");
@@ -119,9 +118,48 @@ fn list_tables() {
 }
 
 #[test]
+// Test that these signatures compile
+fn tuple_type_function_lifetime() {
+    #[allow(dead_code)]
+    fn insert_inferred_lifetime(table: &mut redb::Table<(&str, u8), u64>) {
+        table
+            .insert(&(String::from("hello").as_str(), 8), &1)
+            .unwrap();
+    }
+
+    #[allow(dead_code)]
+    fn insert_explicit_lifetime<'a>(table: &mut redb::Table<(&'a str, u8), u64>) {
+        table
+            .insert(&(String::from("hello").as_str(), 8), &1)
+            .unwrap();
+    }
+}
+
+#[test]
+fn tuple_type_lifetime() {
+    let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
+
+    let table_def: TableDefinition<(&str, u8), (u16, u32)> = TableDefinition::new("table");
+
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(table_def).unwrap();
+        table
+            .insert(&(String::from("hello").as_str(), 5), &(0, 123))
+            .unwrap();
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(table_def).unwrap();
+    assert_eq!(table.get(&("hello", 5)).unwrap().unwrap(), (0, 123));
+}
+
+#[test]
 fn tuple2_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8), (u16, u32)> = TableDefinition::new("table");
 
@@ -140,7 +178,7 @@ fn tuple2_type() {
 #[test]
 fn tuple3_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16), (u16, u32)> = TableDefinition::new("table");
 
@@ -159,7 +197,7 @@ fn tuple3_type() {
 #[test]
 fn tuple4_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32), (u16, u32)> =
         TableDefinition::new("table");
@@ -180,7 +218,7 @@ fn tuple4_type() {
 #[allow(clippy::type_complexity)]
 fn tuple5_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32, u64), (u16, u32)> =
         TableDefinition::new("table");
@@ -204,7 +242,7 @@ fn tuple5_type() {
 #[allow(clippy::type_complexity)]
 fn tuple6_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32, u64, u128), (u16, u32)> =
         TableDefinition::new("table");
@@ -228,7 +266,7 @@ fn tuple6_type() {
 #[allow(clippy::type_complexity)]
 fn tuple7_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32, u64, u128, i8), (u16, u32)> =
         TableDefinition::new("table");
@@ -254,7 +292,7 @@ fn tuple7_type() {
 #[allow(clippy::type_complexity)]
 fn tuple8_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32, u64, u128, i8, i16), (u16, u32)> =
         TableDefinition::new("table");
@@ -283,7 +321,7 @@ fn tuple8_type() {
 #[allow(clippy::type_complexity)]
 fn tuple9_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32, u64, u128, i8, i16, i32), (u16, u32)> =
         TableDefinition::new("table");
@@ -312,7 +350,7 @@ fn tuple9_type() {
 #[allow(clippy::type_complexity)]
 fn tuple10_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<(&str, u8, u16, u32, u64, u128, i8, i16, i32, i64), (u16, u32)> =
         TableDefinition::new("table");
@@ -341,7 +379,7 @@ fn tuple10_type() {
 #[allow(clippy::type_complexity)]
 fn tuple11_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<
         (&str, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128),
@@ -372,7 +410,7 @@ fn tuple11_type() {
 #[allow(clippy::type_complexity)]
 fn tuple12_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let table_def: TableDefinition<
         (&str, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, &str),
@@ -405,7 +443,7 @@ fn tuple12_type() {
 #[test]
 fn is_empty() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let write_txn = db.begin_write().unwrap();
     {
@@ -422,7 +460,7 @@ fn is_empty() {
 #[test]
 fn abort() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let write_txn = db.begin_write().unwrap();
     {
@@ -452,7 +490,7 @@ fn abort() {
 #[test]
 fn insert_overwrite() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -480,7 +518,7 @@ fn insert_overwrite() {
 #[test]
 fn insert_reserve() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let value = b"world";
     let write_txn = db.begin_write().unwrap();
     {
@@ -498,7 +536,7 @@ fn insert_reserve() {
 #[test]
 fn delete() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -532,7 +570,7 @@ fn delete() {
 #[test]
 fn no_dirty_reads() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -552,7 +590,7 @@ fn no_dirty_reads() {
 #[test]
 fn read_isolation() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -589,7 +627,7 @@ fn read_isolation() {
 #[test]
 fn read_isolation2() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
@@ -625,7 +663,7 @@ fn read_isolation2() {
 #[test]
 fn reopen_table() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
@@ -641,23 +679,25 @@ fn reopen_table() {
 #[test]
 fn u64_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(U64_TABLE).unwrap();
         table.insert(&0, &1).unwrap();
+        table.insert(&1, &1).unwrap();
     }
     write_txn.commit().unwrap();
 
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_table(U64_TABLE).unwrap();
+    assert_eq!(2u64, table.range(0..2).unwrap().map(|(_, x)| x).sum());
     assert_eq!(1, table.get(&0).unwrap().unwrap());
 }
 
 #[test]
 fn i128_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
 
     let definition: TableDefinition<i128, i128> = TableDefinition::new("x");
@@ -673,7 +713,7 @@ fn i128_type() {
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_table(definition).unwrap();
     assert_eq!(-2, table.get(&-1).unwrap().unwrap());
-    let mut iter: RangeIter<i128, i128> = table.range::<RangeFull, i128>(..).unwrap();
+    let mut iter: RangeIter<i128, i128> = table.range::<i128>(..).unwrap();
     for i in -11..10 {
         assert_eq!(iter.next().unwrap().1, i);
     }
@@ -683,7 +723,7 @@ fn i128_type() {
 #[test]
 fn f32_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let definition: TableDefinition<u8, f32> = TableDefinition::new("x");
 
@@ -702,9 +742,9 @@ fn f32_type() {
 #[test]
 fn str_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
-    let definition: TableDefinition<str, str> = TableDefinition::new("x");
+    let definition: TableDefinition<&str, &str> = TableDefinition::new("x");
 
     let write_txn = db.begin_write().unwrap();
     {
@@ -715,19 +755,13 @@ fn str_type() {
 
     let read_txn = db.begin_read().unwrap();
     let table = read_txn.open_table(definition).unwrap();
-    let hello = "hello".to_string();
-    assert_eq!("world", table.get(&hello).unwrap().unwrap());
+    assert_eq!("world", table.get("hello").unwrap().unwrap());
 
-    // TODO: is there a way to avoid having to annotate the return type for RangeFull queries?
-    let mut iter: RangeIter<str, str> = table.range::<RangeFull, &str>(..).unwrap();
+    let mut iter = table.iter().unwrap();
     assert_eq!(iter.next().unwrap().1, "world");
     assert!(iter.next().is_none());
 
-    let mut iter: RangeIter<str, str> = table.range("a".to_string().."z".to_string()).unwrap();
-    assert_eq!(iter.next().unwrap().1, "world");
-    assert!(iter.next().is_none());
-
-    let mut iter: RangeIter<str, str> = table.range("a".."z").unwrap();
+    let mut iter: RangeIter<&str, &str> = table.range("a".."z").unwrap();
     assert_eq!(iter.next().unwrap().1, "world");
     assert!(iter.next().is_none());
 }
@@ -735,7 +769,7 @@ fn str_type() {
 #[test]
 fn empty_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let definition: TableDefinition<u8, ()> = TableDefinition::new("x");
 
@@ -754,9 +788,9 @@ fn empty_type() {
 #[test]
 fn array_type() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
-    let definition: TableDefinition<[u8; 5], [u8; 9]> = TableDefinition::new("x");
+    let definition: TableDefinition<&[u8; 5], &[u8; 9]> = TableDefinition::new("x");
 
     let write_txn = db.begin_write().unwrap();
     {
@@ -770,7 +804,7 @@ fn array_type() {
     let hello = b"hello";
     assert_eq!(b"world_123", table.get(hello).unwrap().unwrap());
 
-    let mut iter: RangeIter<[u8; 5], [u8; 9]> = table.range::<RangeFull, &[u8; 5]>(..).unwrap();
+    let mut iter: RangeIter<&[u8; 5], &[u8; 9]> = table.range::<&[u8; 5]>(..).unwrap();
     assert_eq!(iter.next().unwrap().1, b"world_123");
     assert!(iter.next().is_none());
 }
@@ -778,7 +812,7 @@ fn array_type() {
 #[test]
 fn owned_get_signatures() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
 
     let definition: TableDefinition<u32, u32> = TableDefinition::new("x");
 
@@ -796,7 +830,7 @@ fn owned_get_signatures() {
 
     assert_eq!(2, table.get(&1).unwrap().unwrap());
 
-    let mut iter: RangeIter<u32, u32> = table.range::<RangeFull, u32>(..).unwrap();
+    let mut iter: RangeIter<u32, u32> = table.range::<u32>(..).unwrap();
     for i in 0..10 {
         assert_eq!(iter.next().unwrap().1, i + 1);
     }
@@ -806,7 +840,7 @@ fn owned_get_signatures() {
         assert_eq!(iter.next().unwrap().1, i + 1);
     }
     assert!(iter.next().is_none());
-    let mut iter = table.range::<Range<&u32>, &u32>(&0..&10).unwrap();
+    let mut iter = table.range::<&u32>(&0..&10).unwrap();
     for i in 0..10 {
         assert_eq!(iter.next().unwrap().1, i + 1);
     }
@@ -816,11 +850,11 @@ fn owned_get_signatures() {
 #[test]
 fn ref_get_signatures() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(SLICE_TABLE).unwrap();
-        for i in 0..10 {
+        for i in 0..10u8 {
             table.insert(&[i], &[i + 1]).unwrap();
         }
     }
@@ -836,7 +870,7 @@ fn ref_get_signatures() {
 
     let start = vec![0u8];
     let end = vec![10u8];
-    let mut iter = table.range::<RangeFull, &[u8]>(..).unwrap();
+    let mut iter = table.range::<&[u8]>(..).unwrap();
     for i in 0..10 {
         assert_eq!(iter.next().unwrap().1, &[i + 1]);
     }
@@ -855,7 +889,7 @@ fn ref_get_signatures() {
     }
     assert!(iter.next().is_none());
 
-    let mut iter = table.range([0u8].as_slice()..[10u8].as_slice()).unwrap();
+    let mut iter = table.range([0u8]..[10u8]).unwrap();
     for i in 0..10 {
         assert_eq!(iter.next().unwrap().1, &[i + 1]);
     }
@@ -865,26 +899,28 @@ fn ref_get_signatures() {
 #[test]
 fn str_ref() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() };
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
     let definition: TableDefinition<str, [u8]> = TableDefinition::new("x");
     let ref_definition: TableDefinition<&str, [u8]> = TableDefinition::new("x");
     let write_txn = db.begin_write().unwrap();
     {
         let mut table = write_txn.open_table(ref_definition).unwrap();
-        table.insert(&"hello", b"world").unwrap();
+        table.insert("hello", b"world").unwrap();
+        let hello2 = "hello2".to_string();
+        table.insert(hello2.as_str(), b"world").unwrap();
     }
     write_txn.commit().unwrap();
 
     let read_txn = db.begin_read().unwrap();
     // Check that a &str can be read back as a str
     let table = read_txn.open_table(definition).unwrap();
-    assert_eq!(table.len().unwrap(), 1);
+    assert_eq!(table.len().unwrap(), 2);
 }
 
 #[test]
 fn concurrent_write_transactions_block() {
     let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-    let db = sync::Arc::new(unsafe { Database::create(tmpfile.path(), 1024 * 1024).unwrap() });
+    let db = sync::Arc::new(unsafe { Database::create(tmpfile.path()).unwrap() });
     let wtx = db.begin_write().unwrap();
     let (sender, receiver) = sync::mpsc::channel();
 
@@ -900,4 +936,27 @@ fn concurrent_write_transactions_block() {
     std::thread::sleep(std::time::Duration::from_secs(1));
     wtx.commit().unwrap();
     t.join().unwrap();
+}
+
+#[test]
+fn iter() {
+    let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
+    let db = unsafe { Database::create(tmpfile.path()).unwrap() };
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut table = write_txn.open_table(U64_TABLE).unwrap();
+        for i in 0..10 {
+            table.insert(&i, &i).unwrap();
+        }
+    }
+    write_txn.commit().unwrap();
+
+    let read_txn = db.begin_read().unwrap();
+    let table = read_txn.open_table(U64_TABLE).unwrap();
+    let mut iter = table.iter().unwrap();
+    for i in 0..10 {
+        let (k, v) = iter.next().unwrap();
+        assert_eq!(i, k);
+        assert_eq!(i, v);
+    }
 }

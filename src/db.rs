@@ -1,12 +1,11 @@
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::tree_store::{
-    get_db_size, AllPageNumbersBtreeIter, BtreeRangeIter, FreedTableKey, InternalTableDefinition,
-    RawBtree, TableType, TransactionalMemory, DB_HEADER_SIZE,
+    AllPageNumbersBtreeIter, BtreeRangeIter, FreedTableKey, InternalTableDefinition, RawBtree,
+    TableType, TransactionalMemory,
 };
 use crate::types::{RedbKey, RedbValue};
 use crate::Error;
 use crate::{ReadTransaction, Result, WriteTransaction};
-use std::cmp::max;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -149,8 +148,7 @@ impl<'a, K: RedbKey + ?Sized, V: RedbKey + ?Sized> Display for MultimapTableDefi
 /// # fn main() -> Result<(), Error> {
 /// # let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
 /// # let filename = tmpfile.path();
-/// # let db_max_size = 1024 * 1024;
-/// let db = unsafe { Database::create(filename, db_max_size)? };
+/// let db = unsafe { Database::create(filename)? };
 /// let write_txn = db.begin_write()?;
 /// {
 ///     let mut table = write_txn.open_table(TABLE)?;
@@ -173,32 +171,11 @@ impl Database {
     /// * if the file is a valid redb database, it will be opened
     /// * otherwise this function will return an error
     ///
-    /// `db_size`: the maximum size in bytes of the database.
-    ///
     /// # Safety
     ///
     /// The file referenced by `path` must not be concurrently modified by any other process
-    pub unsafe fn create(path: impl AsRef<Path>, db_size: usize) -> Result<Database> {
-        let db_size = db_size as u64;
-        let file = if path.as_ref().exists() && File::open(path.as_ref())?.metadata()?.len() > 0 {
-            let existing_size = Self::get_db_size(path.as_ref())?;
-            if existing_size != db_size {
-                return Err(Error::DbSizeMismatch {
-                    path: path.as_ref().to_string_lossy().to_string(),
-                    size: existing_size,
-                    requested_size: db_size,
-                });
-            }
-            OpenOptions::new().read(true).write(true).open(path)?
-        } else {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .open(path)?
-        };
-
-        Database::new(file, db_size, None, None, true, None)
+    pub unsafe fn create(path: impl AsRef<Path>) -> Result<Database> {
+        Self::builder().create(path)
     }
 
     /// Opens an existing redb database.
@@ -210,32 +187,10 @@ impl Database {
         if !path.as_ref().exists() {
             Err(Error::Io(ErrorKind::NotFound.into()))
         } else if File::open(path.as_ref())?.metadata()?.len() > 0 {
-            let existing_size = Self::get_db_size(path.as_ref())?;
             let file = OpenOptions::new().read(true).write(true).open(path)?;
-            Database::new(file, existing_size, None, None, true, None)
+            Database::new(file, None, None, None, None)
         } else {
             Err(Error::Io(io::Error::from(ErrorKind::InvalidData)))
-        }
-    }
-
-    #[inline]
-    fn get_db_size(path: impl AsRef<Path>) -> Result<u64> {
-        #[cfg(unix)]
-        {
-            Ok(get_db_size(path)?)
-        }
-        #[cfg(windows)]
-        {
-            get_db_size(path).map_err(|err| {
-                // On Windows, an exclusive file lock also applies to reads, unlike on Unix, so
-                // we detect that specific error code and transform it to the correct error
-                // 0x21 - ERROR_LOCK_VIOLATION
-                if matches!(err.raw_os_error(), Some(0x21)) {
-                    Error::DatabaseAlreadyOpen
-                } else {
-                    err.into()
-                }
-            })
         }
     }
 
@@ -272,8 +227,8 @@ impl Database {
         }
 
         // Iterate over all other tables
-        let iter: BtreeRangeIter<str, InternalTableDefinition> =
-            BtreeRangeIter::new::<RangeFull, str>(.., Some(root), mem);
+        let iter: BtreeRangeIter<&str, InternalTableDefinition> =
+            BtreeRangeIter::new::<RangeFull, &str>(.., Some(root), mem);
         for entry in iter {
             let definition = InternalTableDefinition::from_bytes(entry.value());
             if let Some((table_root, table_checksum)) = definition.get_root() {
@@ -295,27 +250,17 @@ impl Database {
 
     fn new(
         file: File,
-        max_capacity: u64,
         page_size: Option<usize>,
         region_size: Option<usize>,
-        dynamic_growth: bool,
+        initial_size: Option<u64>,
         write_strategy: Option<WriteStrategy>,
     ) -> Result<Self> {
         #[cfg(feature = "logging")]
         let file_path = format!("{:?}", &file);
         #[cfg(feature = "logging")]
-        info!(
-            "Opening database {:?} with max size {}",
-            &file_path, max_capacity
-        );
-        let mut mem = TransactionalMemory::new(
-            file,
-            max_capacity,
-            page_size,
-            region_size,
-            dynamic_growth,
-            write_strategy,
-        )?;
+        info!("Opening database {:?}", &file_path);
+        let mut mem =
+            TransactionalMemory::new(file, page_size, region_size, initial_size, write_strategy)?;
         if mem.needs_repair()? {
             #[cfg(feature = "logging")]
             warn!("Database {:?} not shutdown cleanly. Repairing", &file_path);
@@ -337,8 +282,8 @@ impl Database {
             mem.mark_pages_allocated(master_pages_iter)?;
 
             // Iterate over all other tables
-            let iter: BtreeRangeIter<str, InternalTableDefinition> =
-                BtreeRangeIter::new::<RangeFull, str>(.., Some(root), &mem);
+            let iter: BtreeRangeIter<&str, InternalTableDefinition> =
+                BtreeRangeIter::new::<RangeFull, &str>(.., Some(root), &mem);
 
             // Chain all the other tables to the master table iter
             for entry in iter {
@@ -484,7 +429,7 @@ impl Database {
 /// Both strategies have security tradeoffs in situations where an attacker has a high degree of
 /// control over the database workload. For example being able to control the exact order of reads
 /// and writes, or being able to crash the database process at will.
-#[derive(Default, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub enum WriteStrategy {
     /// Optimize for minimum write transaction latency by calculating and storing recursive checksums
     /// of database contents, with a single-phase [`WriteTransaction::commit`] that makes a single
@@ -507,7 +452,6 @@ pub enum WriteStrategy {
     /// attacker with an extremely high degree of control over the database's workload, including
     /// the ability to cause the database process to crash, can cause invalid data to be written
     /// with a valid checksum, leaving the database in an invalid, attacker-controlled state.
-    #[default]
     Checksum,
     /// Optimize for maximum write transaction throughput by omitting checksums, with a two-phase
     /// [`WriteTransaction::commit`] that makes two calls to `fsync`.
@@ -536,35 +480,36 @@ pub enum WriteStrategy {
 pub struct Builder {
     page_size: Option<usize>,
     region_size: Option<usize>,
-    dynamic_growth: bool,
-    write_strategy: WriteStrategy,
+    initial_size: Option<u64>,
+    write_strategy: Option<WriteStrategy>,
 }
 
 impl Builder {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            page_size: None,
+            // Default to 4k pages. Benchmarking showed that this was a good default on all platforms,
+            // including MacOS with 16k pages. Therefore, users are not allowed to configure it at the moment.
+            // It is part of the file format, so can be enabled in the future.
+            page_size: Some(4096),
             region_size: None,
-            dynamic_growth: true,
-            write_strategy: WriteStrategy::default(),
+            initial_size: None,
+            write_strategy: None,
         }
     }
 
     /// Set the internal page size of the database
     ///
     /// Valid values are powers of two, greater than or equal to 512
-    ///
-    /// Larger page sizes will reduce the database file's overhead, but may decrease write performance
-    /// Defaults to the native OS page size
+    #[cfg(any(fuzzing, test))]
     pub fn set_page_size(&mut self, size: usize) -> &mut Self {
         assert!(size.is_power_of_two());
-        self.page_size = Some(max(size, DB_HEADER_SIZE));
+        self.page_size = Some(std::cmp::max(size, 512));
         self
     }
 
     pub fn set_write_strategy(&mut self, write_strategy: WriteStrategy) -> &mut Self {
-        self.write_strategy = write_strategy;
+        self.write_strategy = Some(write_strategy);
         self
     }
 
@@ -576,11 +521,12 @@ impl Builder {
         self
     }
 
-    /// Whether to grow the database file dynamically.
-    /// When set to true, the database file will start at a small size and grow as insertions are made
-    /// When set to false, the database file will be statically sized
-    pub fn set_dynamic_growth(&mut self, enabled: bool) -> &mut Self {
-        self.dynamic_growth = enabled;
+    /// The initial amount of usable space in bytes for the database
+    ///
+    /// Databases grow dynamically, so it is generally unnecessary to set this. However, it can
+    /// be used to avoid runtime overhead caused by resizing the database.
+    pub fn set_initial_size(&mut self, size: u64) -> &mut Self {
+        self.initial_size = Some(size);
         self
     }
 
@@ -589,12 +535,10 @@ impl Builder {
     /// * if the file is a valid redb database, it will be opened
     /// * otherwise this function will return an error
     ///
-    /// `db_size`: the maximum size in bytes of the database.
-    ///
     /// # Safety
     ///
     /// The file referenced by `path` must not be concurrently modified by any other process
-    pub unsafe fn create(&self, path: impl AsRef<Path>, db_size: usize) -> Result<Database> {
+    pub unsafe fn create(&self, path: impl AsRef<Path>) -> Result<Database> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -603,11 +547,10 @@ impl Builder {
 
         Database::new(
             file,
-            db_size as u64,
             self.page_size,
             self.region_size,
-            self.dynamic_growth,
-            Some(self.write_strategy),
+            self.initial_size,
+            self.write_strategy,
         )
     }
 }
@@ -631,14 +574,13 @@ mod test {
     #[cfg(unix)]
     fn dynamic_shrink() {
         let tmpfile: NamedTempFile = NamedTempFile::new().unwrap();
-        let table_definition: TableDefinition<u64, [u8]> = TableDefinition::new("x");
-        let big_value = vec![0; 1024];
+        let table_definition: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+        let big_value = vec![0u8; 1024];
 
-        let db_size = 20 * 1024 * 1024;
         let db = unsafe {
             Database::builder()
                 .set_region_size(1024 * 1024)
-                .create(tmpfile.path(), db_size)
+                .create(tmpfile.path())
                 .unwrap()
         };
 
